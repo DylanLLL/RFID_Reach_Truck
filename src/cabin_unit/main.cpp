@@ -14,14 +14,13 @@ static TFT_eSPI tft = TFT_eSPI();
 // labels encode, byte for byte -- the Zebra -> Stockholm parser expects that
 // exact format. Scan a real beam label and capture the raw string before this
 // goes anywhere near a pilot. See CLAUDE.md "Open items".
-static const char *const kSampleLocations[] = {
-    "MRD-R12-B08-L03-A",
-    "MRD-R12-B08-L03-B",
-    "MRD-R01-B01-L01-A",
-    "MRD-R47-B22-L05-B",
+static const char* const kSampleLocations[] = {
+  "MRD-R12-B08-L03-A",
+  "MRD-R12-B08-L03-B",
+  "MRD-R01-B01-L01-A",
+  "MRD-R47-B22-L05-B",
 };
-static const size_t kSampleCount =
-    sizeof(kSampleLocations) / sizeof(kSampleLocations[0]);
+static const size_t kSampleCount = sizeof(kSampleLocations) / sizeof(kSampleLocations[0]);
 
 // Version 3 is 29x29 modules and holds 32 bytes at ECC_MEDIUM -- ample for a
 // ~17 char location. If the real payload turns out longer, raise the version
@@ -38,15 +37,14 @@ static constexpr int16_t kLabelHeight = 56;
 
 // Black modules on a white ground, never inverted -- imagers expect dark-on-light
 // and a large fraction will refuse an inverted code.
-static void drawLocationQr(const char *text)
+static void drawLocationQr(const char* text)
 {
   QRCode qr;
   uint8_t buffer[qrcode_getBufferSize(kQrVersion)];
 
   if (qrcode_initText(&qr, buffer, kQrVersion, ECC_MEDIUM, text) < 0)
   {
-    Serial.printf("QR encode FAILED for \"%s\" (too long for version %u?)\n",
-                  text, kQrVersion);
+    Serial.printf("QR encode FAILED for \"%s\" (too long for version %u?)\n", text, kQrVersion);
     tft.fillScreen(TFT_BLACK);
     tft.setTextColor(TFT_RED, TFT_BLACK);
     tft.setTextDatum(MC_DATUM);
@@ -91,8 +89,7 @@ static void drawLocationQr(const char *text)
   tft.setTextDatum(MC_DATUM);
   tft.drawString(text, tft.width() / 2, tft.height() - kLabelHeight / 2, font);
 
-  Serial.printf("drew \"%s\"  %dx%d modules @ %dpx = %dpx\n", text, modules,
-                modules, scale, rendered);
+  Serial.printf("drew \"%s\"  %dx%d modules @ %dpx = %dpx\n", text, modules, modules, scale, rendered);
 }
 
 // Distinguishes "SPI is dead" from "panel works but colours are off" before
@@ -103,15 +100,15 @@ static void panelSelfTest()
   struct
   {
     uint16_t colour;
-    const char *name;
+    const char* name;
   } steps[] = {
-      {TFT_RED, "RED"},
-      {TFT_GREEN, "GREEN"},
-      {TFT_BLUE, "BLUE"},
-      {TFT_WHITE, "WHITE"},
+    { TFT_RED, "RED" },
+    { TFT_GREEN, "GREEN" },
+    { TFT_BLUE, "BLUE" },
+    { TFT_WHITE, "WHITE" },
   };
 
-  for (auto &step : steps)
+  for (auto& step : steps)
   {
     Serial.printf("self-test: %s\n", step.name);
     tft.fillScreen(step.colour);
@@ -129,10 +126,8 @@ void setup()
 
   Serial.println();
   Serial.println("=== cabin unit: display bring-up ===");
-  Serial.printf("psram: %lu bytes (%s)\n", (unsigned long)ESP.getPsramSize(),
-                psramFound() ? "detected" : "NOT FOUND");
-  Serial.printf("panel: %dx%d @ %d Hz SPI\n", TFT_WIDTH, TFT_HEIGHT,
-                SPI_FREQUENCY);
+  Serial.printf("psram: %lu bytes (%s)\n", (unsigned long)ESP.getPsramSize(), psramFound() ? "detected" : "NOT FOUND");
+  Serial.printf("panel: %dx%d @ %d Hz SPI\n", TFT_WIDTH, TFT_HEIGHT, SPI_FREQUENCY);
 
   tft.init();
   tft.setRotation(0);  // portrait; QR above, location text below
