@@ -96,6 +96,73 @@ renamed locations).
 
 Decide before 33,700 tags are encoded.
 
+## R200 driver (`lib/R200/`)
+
+Adapted from Alastair Aitchison's Playful Technology demo. PlatformIO only sees a `lib/` library if
+it is in its own subdirectory, hence `lib/R200/R200.{h,cpp}` — files loose in `lib/` are silently
+ignored and `#include "R200.h"` will not resolve.
+
+Single-poll response frame, with the offsets that matter:
+
+    AA 02 22 00 11 C7 30 00 E2 80 ... A7 11 9B 29 DD
+    [0] header  [1] type  [2] cmd  [3][4] param len
+    [5] RSSI    [6][7] PC  [8..19] EPC (12 bytes)  [20][21] CRC  [22] checksum  [23] end
+
+**The upstream code read these one byte late** — RSSI from `[6]`, EPC from `[9]`. Fixed 2026-09-08.
+This mattered more than it looks: `[6]` is the PC code's MSB, a constant `0x30` on standard tags, so
+**RSSI read as a constant**. Since RSSI arbitration is what distinguishes the two tags on a beam
+(decision 4), that bug would have looked like "RSSI can't separate the tags" rather than like a
+parsing error. The EPC was shifted a byte, dropping its leading byte and picking up a CRC byte.
+
+`-DDEBUG` is set in the `R200` env because **every print in the successful-read path sits inside
+`#ifdef DEBUG`** — without it a working reader looks completely dead.
+
+### `receiveData()` is length-driven — rewritten 2026-09-08
+
+The upstream version scanned for the `0xDD` frame-end byte. Two failures, both fixed:
+
+1. `0xDD` occurs inside EPC and CRC payloads — roughly 5% of random 12-byte EPCs contain one — and
+   truncated the frame mid-EPC. About 1,700 of 33,700 tags would have read intermittently.
+2. Its `break` on frame-end left only the inner loop, so the outer `while` span the **full timeout on
+   every call**, and bytes arriving in the meantime were appended past the frame end, invalidating an
+   otherwise good frame.
+
+It now hunts for the `0xAA` header (which also resynchronises after corruption), reads the fixed
+5-byte prefix, then consumes exactly `7 + paramLength` bytes total and returns the moment the frame
+is complete. Frames claiming more than `RX_BUFFER_LENGTH` are rejected.
+
+The default timeout dropped from 500 ms to **100 ms**. It now only applies to silence, and 500 ms of
+it would blow the 150-300 ms sampling window on a single stray byte. A 24-byte frame at 115200 baud
+takes ~2 ms, so 100 ms is ~50x margin. The busy-wait calls `yield()` so it can't starve the idle task.
+
+### Other fixes applied to the vendor code
+
+- `calculateCheckSum()` and `dataIsValid()` indexed using an unvalidated wire length. `CRCpos` was a
+  `uint8_t`, so `5 + paramLength` wrapped mod 256; `calculateCheckSum()` could walk up to 64 KB past
+  a 64-byte buffer. Both bounds-checked now — the likeliest source of unexplained field crashes.
+- `parseReceivedData()` returned nothing on any path (compiler-confirmed UB). Note it always used the
+  *correct* EPC offset 8, contradicting the `loop()` path that was actually executing.
+- `printHexWord()` used `println` for the MSB, splitting every word across two lines.
+- Three `char*` parameters that string literals can't bind to in C++11. Build is now warning-free.
+
+### Verified against real hardware, 2026-09-08
+
+A tag read that was checked byte-for-byte:
+
+    RSSI 0xBA   PC 0x3000   EPC E28069150000402092916188   CRC 0xFF46
+
+- The **Gen2 CRC-16 over PC+EPC computes to 0xFF46**, matching what the tag reported. That match is
+  only possible if both fields are read from the correct offsets, so the parse is confirmed.
+- PC `0x3000` → bits 15-11 = 6 words = 12-byte EPC, consistent with what was read.
+- RSSI `0xBA` = **-70 dBm** as a signed int8. It varies per read, which is itself the proof the
+  offset fix works — pre-fix this field printed a constant `0x30`.
+- EPCs are factory-serialised and unique, starting `E2` (EPCglobal class ID). Good sanity check for
+  alignment: if a read ever comes back missing that leading `E2`, offsets have shifted again.
+
+**The library hardcodes 12-byte EPCs** (`memcpy(uid, &_buffer[8], 12)`) even though the PC word
+declares the length. Fine while every tag is 96-bit, but it misparses silently rather than erroring
+if that ever changes — relevant if decision 5 goes ahead and EPC length becomes ours to choose.
+
 ## Invariants
 
 **A stale QR code is worse than no QR code.** If the OLED keeps showing the previous bay's code after
@@ -109,12 +176,35 @@ authority behind it. Every displayed QR needs a freshness contract:
 
 ## Open items
 
+Roughly in order of how much they can still invalidate the design.
+
+- **Confirm RSSI actually separates two tags on one beam.** The single highest risk in the project:
+  decision 4 rests entirely on it, and nothing has tested it yet. Two parts. (a) Does RSSI track
+  distance sensibly — sweep one tag from ~10 cm to ~2 m and check it climbs toward -40/-50 close in
+  and falls to -80/-90 at range. (b) The real geometry — two tags 1.2 m apart as they sit on a beam,
+  antenna at its mounting angle, **attenuator fitted**, read from the fork's actual position. The
+  number that matters is the *margin* between the two, because that sets the "margin too thin, display
+  nothing" threshold. Bench figures will flatter; multipath in a metal canyon is where this is decided.
 - **Verify the QR payload byte-for-byte.** The generated QR must encode exactly what the beam labels
   encode today, because the Zebra -> Stockholm parser expects that format. Scan an existing beam label,
   capture the raw decoded string, match precisely. Cheap now, expensive to find during a pilot.
-- Test whether the RF200 can write EPCs (gates decision 5).
-- Confirm real-world RSSI separation between the two tags on one beam, with the attenuator fitted and
-  the antenna at its mounting angle.
+- **Test whether the RF200 can write EPCs** (gates decision 5). Beyond "does it write", check whether
+  the tags ship locked or with an access password set — some pre-encoded stock does, which turns a
+  firmware question into a procurement one.
+- Log RSSI per tag type at a fixed distance. Anti-metal performance varies widely between products and
+  this is a 33,700-unit purchasing decision.
+- Reconcile the BOM: it lists a "3.5 inch OLED", the hardware is a 3.2" ILI9341 TFT.
+
+## Next steps
+
+The two units have been brought up independently and neither talks to the other yet.
+
+1. ESP-NOW link between the two dev boards on the bench (`esp_get_mac_address` env prints the MACs
+   needed to peer them). Testable now, without the RF200 or the fork hardware.
+2. Feed a real EPC from the R200 into the cabin unit over that link and render its QR — the first
+   end-to-end path.
+3. The lookup table: build the packed format, load it into PSRAM, persist to LittleFS.
+4. Firebase sync on the cabin unit, in an idle window.
 
 ## Display rendering rules
 
@@ -130,13 +220,38 @@ Learned while bringing up the panel; these are scan-reliability requirements, no
 
 ## Build
 
-Two PlatformIO envs in one project, selected by `build_src_filter`:
+One PlatformIO env per target or bench test, each isolated by `build_src_filter`. **Every env needs
+one** — without it PlatformIO compiles every `.cpp` under `src/` and collides on duplicate
+`setup()`/`loop()` at link time.
 
-- `cabin_unit` -> `src/cabin_unit/` — active
-- fork unit env is currently commented out in `platformio.ini`; `src/main.cpp` is the leftover
-  boilerplate it used to build. When re-enabling it, name it `fork_unit`, point it at
-  `src/fork_unit/`, and give it a `build_src_filter` — without one it compiles every `main.cpp`
-  under `src/` and collides on duplicate `setup()`/`loop()` at link time.
+| Env | Source | State |
+|---|---|---|
+| `cabin_unit` | `src/cabin_unit/` | Display + QR bring-up working |
+| `fork_unit` | `src/fork_unit/` | Builds; boot banner only, no functionality |
+| `R200` | `src/R200.cpp` | Reader bring-up, **confirmed reading real tags** |
+| `ESP-NOW_test` | `src/ESP-NOW_test.cpp` | Bench test |
+| `esp_get_mac_address` | `src/esp_get_mac_address.cpp` | Prints MAC, needed to peer ESP-NOW |
+
+Build or flash a specific one with `-e`, e.g. `pio run -e R200 -t upload && pio device monitor -e R200`.
+
+Two layout traps already hit once each, worth not repeating:
+
+- A `lib/` library must sit in **its own subdirectory** (`lib/R200/R200.{h,cpp}`). Files loose in
+  `lib/` are silently ignored — not compiled, not on the include path — and the symptom is an
+  unresolved `#include` followed by undefined references at link time.
+- `src/fork_unit/` was once created as `src/ fork_unit/` with a leading space, which
+  `build_src_filter = +<fork_unit>` silently never matches.
+- Don't copy the `cabin_unit` env wholesale when adding a new one. Carrying over its TFT_eSPI
+  `lib_deps` plus `-DUSER_SETUP_LOADED` while pointing `-include` at a different (empty) config
+  suppresses TFT_eSPI's own setup and leaves every `TFT_*` symbol undefined. The fork unit has no
+  display and needs neither.
+
+### R200 wiring
+
+`rfid.begin(&Serial2, 115200, 18, 17)` → **GPIO18 = RX** (to the reader's TX), **GPIO17 = TX** (to
+the reader's RX), common ground. Both are clear of the PSRAM range (33-37) and the USB pins (19/20).
+If the module info string comes back garbled or absent, suspect baud or a swapped TX/RX before
+suspecting the tags.
 
 **TFT_eSPI configuration is not in a `User_Setup.h`.** It lives in `src/cabin_unit/config.h` and is
 delivered via two build flags that must stay together:
@@ -173,8 +288,13 @@ is therefore fixed at full — a glare problem for a cab at night, and constant 
 control needs a transistor on a spare GPIO (16 is free); never drive the LED rail straight from a
 pin, it can pull 60-100 mA against the S3's 40 mA per-pin limit.
 
-Cabin unit currently builds and runs a display bring-up test: colour self-test, then cycles sample
-racking locations as QR codes. No ESP-NOW, lookup table or Firebase sync yet. Fork unit is unwritten.
+## Status as of 2026-09-08
+
+- **Cabin unit**: builds and runs. Colour self-test, then cycles sample racking locations as QR codes
+  on the ILI9341. Sample payloads in `main.cpp` are placeholders, not the real label format.
+- **R200 reader**: builds and reads real tags, frame parsing verified against the Gen2 CRC.
+- **Not started**: ESP-NOW link, lookup table, LittleFS persistence, Firebase sync, ultrasonic gating,
+  RSSI arbitration, staleness enforcement. `src/fork_unit/` is an empty placeholder.
 
 `board_upload.flash_size` and `board_build.partitions` are overridden to 16 MB because the board
 profile defaults to an 8 MB partition table, which would strand half the chip.
