@@ -59,11 +59,25 @@ The fork unit is bolted to the carriage in a sealed enclosure on battery — the
 system to reflash. So it holds as little changeable logic as possible. It also has no WiFi, and no
 good way to receive a 527 KB table.
 
-- **Fork unit**: ultrasonic gates a read window -> collect tag inventory -> send
-  `{seq, [(epc, rssi, hits)], gate_state}` over ESP-NOW. Under 60 bytes, well inside the 250-byte limit.
+- **Fork unit**: ultrasonic gates a read window -> collect tag inventory -> send per-EPC
+  `(epc, rssi, hits)` over ESP-NOW. No decisions.
 - **Cabin unit**: RSSI arbitration, table lookup, QR generation, staleness enforcement, Firebase sync.
 
 Consequence: arbitration policy can be tuned during the pilot by reflashing the accessible unit.
+
+This extends to the **evidence window**: the fork reports every 100 ms as transport granularity,
+and the cabin decides how many reports to pool (currently 300 ms). Had the window lived on the
+fork, tuning it would mean unbolting the carriage enclosure.
+
+The wire format is `include/truck_link.h`, shared by both envs so the ends cannot drift. 12-byte
+header `{version, tagCount, polls, dropped, bootId, seq}` + 14 bytes per tag, max 124 bytes. Any
+layout change bumps `kProtocolVersion`. `bootId` is random per fork boot: without it, a fork reset
+restarts `seq` at 1 and the cabin would reject every report from the new boot as stale. Gate state
+gets added (with a version bump) when the ultrasonic goes in.
+
+Pairing MACs and the ESP-NOW channel are in `include/truck_pairing.h`, hardcoded for the bench
+pair. For 10 trucks this must become per-unit config (NVS or a pairing mode). The cabin drops any
+frame not from its own fork's MAC.
 
 ### 3. ESP-NOW for the inter-ESP32 link
 
@@ -86,6 +100,53 @@ real racking, in heavy multipath.
 
 Policy: sample over a 150-300 ms window, require several hits per EPC, and demand a **minimum RSSI
 margin** between the top two candidates. If the margin is thin, display nothing.
+
+**Hit count alone cannot separate the two tags on a beam** — both are usually in range and both
+clear any hit threshold. The margin decides; the hit count is what makes the margin trustworthy.
+A "N *consecutive* reads of the same EPC" rule fails the other way: with two tags in range the
+reader interleaves them, so the streak never builds even when one is clearly nearer.
+
+Implemented in `src/cabin_unit/main.cpp`, all constants at the top of the file:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `kEvidenceMs` | 300 | Reports pooled per decision (per-EPC hits summed, RSSI hit-weighted) |
+| `kMinHits` | 5 | Winner's minimum reads within the pool, to put a code **up** |
+| `kKeepHits` | 2 | Minimum reads to **keep** a code already up (hysteresis) |
+| `kMinContenderHits` | 2 | Fewer reads = noise, not a rival — so one stray reflection can't blank a solid read |
+| `kMinMarginDb` | 6 | **Placeholder** until the two-tags-on-a-beam test measures it |
+| `kHoldMs` | 600 | Shown code blanks if not re-confirmed for this long |
+| `kLinkTimeoutMs` | 1000 | No reports at all = link down, blank |
+
+Verdicts: *Confirmed* shows the code. *Kept* means it is already up and still read `kKeepHits`
+times. *Ambiguous* (rival within margin) blanks **immediately**, kept or not. *Insufficient* holds
+the current code until `kHoldMs`, unless the strongest tag is now a different EPC, which also
+blanks immediately.
+
+**Read rate falls with signal, so `kMinHits` is an implicit range limit.** Bench, 2026-09-29, one
+tag moved away from the antenna (pool = 300 ms):
+
+| RSSI | Reads / polls | Verdict at `kMinHits` 5 |
+|---|---|---|
+| -49 dBm | 7 / 9 | Confirmed |
+| -52 dBm | 5 / 9 | Confirmed |
+| -62 dBm | 3 / 11 | Insufficient |
+| -70 dBm | 3 / 17 | Insufficient |
+
+So nothing *new* is shown below about -55 to -60 dBm on the bench. That is partly deliberate: the
+attenuator exists to shorten range, and a weak, intermittent read is what a neighbouring bay's
+tag looks like. But the cutoff was set by accident, not measured. If the correct beam tag reads
+weaker than this at real fork insertion, lower `kMinHits` or lengthen `kEvidenceMs`. Once that
+number is known, an explicit RSSI floor would express the range limit more clearly than read rate,
+which also depends on round timing (polls rise from 9 to 17 as tags drop out, because "no tag" rounds
+end faster).
+
+Polls/window also shows the reader completes ~30 rounds/s with a tag present, so 5 reads in
+300 ms is comfortably reachable at close range.
+
+**Keep hysteresis relies on the ultrasonic gate** to clear the code when the forks leave the beam.
+Until gating exists, a kept code stays up for as long as the tag stays faintly readable and no
+other tag overtakes it.
 
 ### 5. EPC encoding — deferred, not rejected
 
@@ -159,9 +220,20 @@ A tag read that was checked byte-for-byte:
 - EPCs are factory-serialised and unique, starting `E2` (EPCglobal class ID). Good sanity check for
   alignment: if a read ever comes back missing that leading `E2`, offsets have shifted again.
 
-**The library hardcodes 12-byte EPCs** (`memcpy(uid, &_buffer[8], 12)`) even though the PC word
-declares the length. Fine while every tag is 96-bit, but it misparses silently rather than erroring
-if that ever changes — relevant if decision 5 goes ahead and EPC length becomes ours to choose.
+**The library assumes 12-byte EPCs** (`memcpy(uid, &_buffer[8], 12)`). As of 2026-09-29 it
+checks the PC word's declared length (and paramLength 17) and discards any other tag frame rather
+than misparsing it. Revisit if decision 5 goes ahead and EPC length becomes ours to choose.
+
+### Caller API
+
+`loop()` returns an `R200_Event` — `EVT_TagRead` (fresh `uid` and `rssi`), `EVT_NoTag` (round
+finished, nothing in range), `EVT_Other`, or `EVT_None`. It consumes at most one frame per call;
+callers that need every read (the fork unit) call it until `EVT_None` and take `uid`/`rssi`
+immediately. `rssi` is public, signed dBm.
+
+Single poll has **no end-of-round marker**: one frame per tag in range, or a single `0x15` "no
+tag" error. The fork unit treats a round as done on `EVT_NoTag`, or after 10 ms of line silence
+following a tag frame, and abandons it after 100 ms with no answer.
 
 ## Invariants
 
@@ -195,16 +267,24 @@ Roughly in order of how much they can still invalidate the design.
   this is a 33,700-unit purchasing decision.
 - Reconcile the BOM: it lists a "3.5 inch OLED", the hardware is a 3.2" ILI9341 TFT.
 
+- **Filter to known location tags before arbitrating.** UHF tags on the goods (apparel, some retail
+  cases) or on the pallet can sit closer to the antenna than the beam tag and win on RSSI. Once
+  the lookup table exists, drop EPCs not in it *before* the margin comparison. If decision 5 is
+  adopted, an EPC prefix could also go into the reader's Select parameters so it never inventories
+  foreign tags at all.
+
 ## Next steps
 
-The two units have been brought up independently and neither talks to the other yet.
+The end-to-end path, R200 -> fork -> ESP-NOW -> cabin -> QR of the EPC, **works on the bench**
+(2026-09-29, single tag). The `kKeepHits` hysteresis was added after that trial and still needs
+re-flashing to confirm.
 
-1. ESP-NOW link between the two dev boards on the bench (`esp_get_mac_address` env prints the MACs
-   needed to peer them). Testable now, without the RF200 or the fork hardware.
-2. Feed a real EPC from the R200 into the cabin unit over that link and render its QR — the first
-   end-to-end path.
-3. The lookup table: build the packed format, load it into PSRAM, persist to LittleFS.
-4. Firebase sync on the cabin unit, in an idle window.
+1. The RSSI margin test (first open item), using the cabin's serial log — it prints pooled RSSI
+   and hits for every EPC in view, per decision.
+2. Ultrasonic gating on the fork, plus `gate_state` in the report (protocol version bump).
+3. The lookup table: build the packed format, load it into PSRAM, persist to LittleFS. Swap the
+   QR payload from EPC hex to the location string.
+4. Firebase sync on the cabin unit, in an idle window, returning to `truck_pairing::kChannel`.
 
 ## Display rendering rules
 
@@ -226,10 +306,10 @@ one** — without it PlatformIO compiles every `.cpp` under `src/` and collides 
 
 | Env | Source | State |
 |---|---|---|
-| `cabin_unit` | `src/cabin_unit/` | Display + QR bring-up working |
-| `fork_unit` | `src/fork_unit/` | Builds; boot banner only, no functionality |
+| `cabin_unit` | `src/cabin_unit/` | ESP-NOW receive, arbitration, QR of winning EPC. **Working on bench** |
+| `fork_unit` | `src/fork_unit/` | R200 inventory + per-EPC tally, reports over ESP-NOW. **Working on bench** |
 | `R200` | `src/R200.cpp` | Reader bring-up, **confirmed reading real tags** |
-| `ESP-NOW_test` | `src/ESP-NOW_test.cpp` | Bench test |
+| `ESP-NOW_test` | `src/ESP-NOW_test.cpp` | Bench test, **verified delivering** |
 | `esp_get_mac_address` | `src/esp_get_mac_address.cpp` | Prints MAC, needed to peer ESP-NOW |
 
 Build or flash a specific one with `-e`, e.g. `pio run -e R200 -t upload && pio device monitor -e R200`.
@@ -288,13 +368,17 @@ is therefore fixed at full — a glare problem for a cab at night, and constant 
 control needs a transistor on a spare GPIO (16 is free); never drive the LED rail straight from a
 pin, it can pull 60-100 mA against the S3's 40 mA per-pin limit.
 
-## Status as of 2026-09-08
+## Status as of 2026-09-29
 
-- **Cabin unit**: builds and runs. Colour self-test, then cycles sample racking locations as QR codes
-  on the ILI9341. Sample payloads in `main.cpp` are placeholders, not the real label format.
-- **R200 reader**: builds and reads real tags, frame parsing verified against the Gen2 CRC.
-- **Not started**: ESP-NOW link, lookup table, LittleFS persistence, Firebase sync, ultrasonic gating,
-  RSSI arbitration, staleness enforcement. `src/fork_unit/` is an empty placeholder.
+- **Fork unit**: runs R200 single-poll rounds back to back, tallies per EPC, and sends a report
+  every 100 ms, empty ones included, so the cabin can tell "no tag" from "link down". Working on
+  the bench.
+- **Cabin unit**: receives reports, enforces seq/bootId freshness and sender MAC, pools 300 ms
+  of evidence, arbitrates, shows the winner's **EPC hex** as a QR (placeholder until the lookup
+  table), with RSSI/hits/margin in a strip under it. Blank screens show a diagnostic text
+  (`FORK UNIT NOT HEARD` / `NO TAG` / `AMBIGUOUS READ`), never a code. Working on the bench.
+- **R200 reader**: reads real tags, frame parsing verified against the Gen2 CRC.
+- **Not started**: ultrasonic gating, lookup table, LittleFS persistence, Firebase sync.
 
 `board_upload.flash_size` and `board_build.partitions` are overridden to 16 MB because the board
 profile defaults to an 8 MB partition table, which would strand half the chip.

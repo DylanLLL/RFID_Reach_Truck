@@ -42,8 +42,10 @@ void printHexWord(const char* name, uint8_t MSB, uint8_t LSB)
   Serial.println(LSB, HEX);
 }
 
-void R200::loop()
+R200::R200_Event R200::loop()
 {
+  R200_Event event = EVT_None;
+
   // Has any new data been received?
   if (dataAvailable())
   {
@@ -52,6 +54,7 @@ void R200::loop()
     {
       if (dataIsValid())
       {
+        event = EVT_Other;
         // If a full frame of data has been received, parse it
         // TODO For reasons that I absolutely cannot fathom, this section does not work if moved into
         // a separate function....
@@ -90,6 +93,16 @@ void R200::loop()
 // the leading EPC byte and picked up the first CRC byte instead. It looked
 // plausible because it was still deterministic per tag.
 // Note R200::parseReceivedData() below already used the correct offset 8.
+            // A tag frame is RSSI(1) + PC(2) + EPC + CRC(2). Everything downstream
+            // assumes a 96-bit EPC, so check the length the tag itself declares in
+            // the PC word (bits 15-11, in 16-bit words: 0x30 >> 3 = 6 = 12 bytes)
+            // rather than silently misparsing a tag that differs.
+            if (arrayToUint16(&_buffer[R200_ParamLengthMSBPos]) != 17 || (_buffer[6] >> 3) != 6)
+            {
+              break;
+            }
+            rssi = (int8_t)_buffer[5];
+            event = EVT_TagRead;
 #ifdef DEBUG
             printHexByte("RSSI", _buffer[5]);
             printHexWord("PC", _buffer[6], _buffer[7]);
@@ -125,6 +138,7 @@ void R200::loop()
               case ERR_InventoryFail:
                 // This is not necessarily a "failure" - it just means that there are no cards in range
                 // Serial.print("No card detected!");
+                event = EVT_NoTag;
                 // If there was previously a uid
                 if (memcmp(uid, blankUid, sizeof uid) != 0)
                 {
@@ -155,6 +169,7 @@ void R200::loop()
       }
     }
   }
+  return event;
 }
 
 // Has any data been received from the reader?

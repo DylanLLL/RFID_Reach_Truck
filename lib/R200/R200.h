@@ -36,10 +36,22 @@ private:
 public:
   R200();
 
+  // What one call to loop() consumed. A caller that needs every read, not just
+  // the latest -- the fork unit counting hits per EPC -- acts on EVT_TagRead and
+  // takes uid and rssi straight away, before the next frame overwrites them.
+  enum R200_Event : byte
+  {
+    EVT_None,     // nothing waiting, or an incomplete/corrupt frame was discarded
+    EVT_TagRead,  // uid and rssi hold a fresh tag read
+    EVT_NoTag,    // an inventory round finished with no tag in range
+    EVT_Other,    // any other valid frame: module info, other errors
+  };
+
   uint8_t uid[12] = { 0 };
+  int8_t rssi = 0;  // dBm, from the same frame that last set uid
 
   bool begin(HardwareSerial* serial = &Serial2, int baud = 115200, uint8_t RxPin = 16, uint8_t TxPin = 17);
-  void loop();
+  R200_Event loop();
   void poll();
   void setMultiplePollingMode(bool enable = true);
   void dumpModuleInfo();
